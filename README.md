@@ -14,7 +14,7 @@ A lightweight cross-platform Python app that fetches your QRZ logbook, caches it
    ```bash
    python -m pip install -r requirements.txt
    ```
-   (or install the minimal set manually: `requests`, `adif_io`, `pandas`, `plotly`).
+   (or install the minimal set manually: `requests`, `adif_io`, `pandas`, `plotly`, `tomli_w`, `tomli`).
 
 2. Create a config and store your API key:
    ```bash
