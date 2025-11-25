@@ -39,6 +39,8 @@ A lightweight cross-platform Python app that fetches your QRZ logbook, caches it
   ```bash
   python qrz_viz.py --visualize-only --start-date 2023-01-01
   ```
+- If the QRZ API returns an error (for example an expired key), the script now surfaces the exact
+  message so you can fix configuration without digging into logs.
 
 ## Configuration guide (`config.toml`)
 The file is created on first run. You can edit it manually:
