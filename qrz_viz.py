@@ -1,238 +1,381 @@
-# Databricks notebook source
-# MAGIC %pip install adif_io cartopy shapely pyproj
+"""Command-line QRZ logbook visualizer.
 
-# COMMAND ----------
+This module fetches logbook entries from the QRZ Logbook API, caches them
+in a small SQLite database to avoid unbounded memory growth, and produces an
+interactive Plotly map plus basic metrics. The app is cross-platform and only
+requires users to provide their QRZ API key and optional preferences via a
+YAML config file.
+"""
 
-# COMMAND ----------
-dbutils.library.restartPython()
+from __future__ import annotations
 
-# COMMAND ----------
-# Cell 1 – imports & constants
-import html, re, requests, adif_io, pandas as pd, numpy as np
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from math import radians, sin, cos, asin, sqrt
-from datetime import datetime, timezone
+import argparse
+import html
+import json
+import os
+import sqlite3
+from datetime import datetime, date
 from pathlib import Path
-from pyspark.sql import SparkSession
+from typing import Iterable
 
-API_KEY = "api_key"
-UA      = "KC2QJA-LogbookViz/1.2"
-BATCH   = 250
-ORIGIN_LAT, ORIGIN_LON = 30.4145, -97.7411
-BAND_COLORS = {"80M":"#00FF7F","40M":"#FFFF55","20M":"#FF5555","17M":"#DA70D6","6M":"#7FFF00","30M":"#00CED1"}
-BG, LAND, OCEAN, TXT, TITLE = "#000000", "#141414", "#002b36", "#00FF7F", "#FF5555"
-FONT = "'Share Tech Mono','IBM Plex Mono',monospace"
+import adif_io
+import pandas as pd
+import plotly.graph_objects as go
+import requests
 
-# COMMAND ----------
-# Cell 2 – fetch QRZ logbook
-def fetch_records(key: str, ua: str = UA, batch: int = BATCH) -> list[dict]:
-    after, recs = 0, []
-    while True:
-        opt = f"MAX:{batch}" + (f",AFTERLOGID:{after}" if after else "")
-        r = requests.post("https://logbook.qrz.com/api",
-                          data={"KEY": key, "ACTION": "FETCH", "OPTION": opt},
-                          headers={"User-Agent": ua}, timeout=30)
-        r.raise_for_status()
-        if "ADIF=" not in r.text:
-            break
-        adif_raw = html.unescape(r.text.split("ADIF=", 1)[1])
-        if not adif_raw.strip():
-            break
-        qsos, _ = adif_io.read_from_string("<adif_ver:5>3.1.0<eoh>\n" + adif_raw + "\n")
-        if not qsos:
-            break
-        recs.extend(qsos)
-        after = max(int(q["app_qrzlog_logid"]) for q in qsos) + 1
-        if len(qsos) < batch:
-            break
-    return recs
+DEFAULT_BATCH = 250
+DEFAULT_UA = "LogbookViz/2.0"
+DEFAULT_CACHE = "~/.cache/qrz_viz/cache.sqlite"
+DEFAULT_OUTPUT = "logbook.html"
+DEFAULT_THEME = {
+    "background": "#000000",
+    "land": "#141414",
+    "ocean": "#002b36",
+    "text": "#00FF7F",
+    "accent": "#FF5555",
+}
 
-records = fetch_records(API_KEY)
 
-# COMMAND ----------
-# Cell 3 – DataFrames & display
-pdf = pd.DataFrame(records, dtype=str).replace({pd.NA: None})
-pdf.columns = [re.sub(r"[^0-9A-Za-z_]", "_", c.strip()) for c in pdf.columns]
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Generate an interactive QRZ logbook map.")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("config.yaml"),
+        help="Path to YAML config file with API key and preferences.",
+    )
+    parser.add_argument(
+        "--start-date",
+        type=str,
+        help="Optional start date (YYYY-MM-DD) to filter QSOs.",
+    )
+    parser.add_argument(
+        "--end-date",
+        type=str,
+        help="Optional end date (YYYY-MM-DD) to filter QSOs.",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path(DEFAULT_OUTPUT),
+        help="Output HTML file for the map.",
+    )
+    parser.add_argument(
+        "--theme",
+        type=str,
+        default="default",
+        help="Theme name from the config file to apply to the visualization.",
+    )
+    return parser.parse_args()
 
-spark = SparkSession.builder.getOrCreate()
-sdf = spark.createDataFrame(pdf)
-df = pdf.copy()
 
-# COMMAND ----------
-# Cell 4 – helper functions
-def _load_csv(path: str, url: str = None, **kw) -> pd.DataFrame:
-    return pd.read_csv(path, **kw) if Path(path).exists() else (pd.read_csv(url, **kw) if url else pd.DataFrame())
+def load_config(path: Path) -> dict:
+    import yaml
 
-def grid2latlon(gs: str):
-    gs = gs.strip().upper()
-    if len(gs) < 4 or not gs[:4].isalnum():
-        return None, None
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Config file '{path}' was not found. Copy config.example.yaml and set your API key."
+        )
+    with path.open("r", encoding="utf-8") as fh:
+        return yaml.safe_load(fh) or {}
+
+
+def normalize_date(val: str | None) -> str | None:
+    if not val:
+        return None
+    val = str(val).strip()
+    if not val:
+        return None
+    if len(val) == 8 and val.isdigit():
+        return f"{val[:4]}-{val[4:6]}-{val[6:]}"
     try:
-        lon = (ord(gs[0])-65)*20 - 180 + int(gs[2])*2 + 1
-        lat = (ord(gs[1])-65)*10 - 90 + int(gs[3]) + 0.5
+        parsed = datetime.fromisoformat(val)
+        return parsed.date().isoformat()
     except ValueError:
-        return None, None
-    if len(gs) >= 6 and gs[4:6].isalpha():
-        lon += (ord(gs[4])-65)*5/60 + 5/120
-        lat += (ord(gs[5])-65)*2.5/60 + 2.5/120
-    return lat, lon
+        return None
 
-def hav(lat1, lon1, lat2, lon2):
-    dlat, dlon = map(radians, [lat2-lat1, lon2-lon1])
-    a = sin(dlat/2)**2 + cos(radians(lat1))*cos(radians(lat2))*sin(dlon/2)**2
-    return 2*6371*asin(sqrt(a))
 
-def _parse_coord(val: str):
+def parse_coord(val: str | None) -> float | None:
+    if not val:
+        return None
     val = str(val).strip()
     if not val:
         return None
     if val[0] in "NSEW":
         parts = val[1:].strip().split()
-        if len(parts) != 2:
-            return None
-        try:
-            deg, minutes = float(parts[0]), float(parts[1])
-            out = deg + minutes/60.0
-            return -out if val[0] in "SW" else out
-        except ValueError:
-            return None
+        if len(parts) == 2:
+            try:
+                deg, minutes = float(parts[0]), float(parts[1])
+                out = deg + minutes / 60.0
+                return -out if val[0] in "SW" else out
+            except ValueError:
+                return None
     try:
         return float(val)
     except ValueError:
         return None
 
-# COMMAND ----------
-# Cell 5 – enrich DataFrame & derive metrics
-us_cent = _load_csv("/dbfs/FileStore/pbuch/us_state_centroids.csv",
-                    "https://raw.githubusercontent.com/plotly/datasets/master/us-state-centroids.csv")
-ca_cent = _load_csv("/dbfs/FileStore/pbuch/ca_province_centroids.csv")
-cent_all = (pd.concat([us_cent, ca_cent], ignore_index=True)
-            .rename(columns=str.lower)
-            .set_index("region").T.to_dict()) if not us_cent.empty else {}
 
-world_coords = _load_csv("/dbfs/FileStore/pbuch/world_coords.csv", dtype=str)
-if not world_coords.empty:
-    world_coords = world_coords.apply(lambda s: s.str.upper())
+def grid_to_latlon(gs: str) -> tuple[float | None, float | None]:
+    gs = gs.strip().upper()
+    if len(gs) < 4 or not gs[:4].isalnum():
+        return None, None
+    try:
+        lon = (ord(gs[0]) - 65) * 20 - 180 + int(gs[2]) * 2 + 1
+        lat = (ord(gs[1]) - 65) * 10 - 90 + int(gs[3]) + 0.5
+    except ValueError:
+        return None, None
+    if len(gs) >= 6 and gs[4:6].isalpha():
+        lon += (ord(gs[4]) - 65) * 5 / 60 + 5 / 120
+        lat += (ord(gs[5]) - 65) * 2.5 / 60 + 2.5 / 120
+    return lat, lon
 
-df.columns = [c.lower() for c in df.columns]
 
-def _coords(row):
-    lat, lon = _parse_coord(row.get("lat")), _parse_coord(row.get("lon"))
-    if lat is not None and lon is not None:
-        return pd.Series([lat, lon])
-    gs = str(row.get("gridsquare") or row.get("my_gridsquare") or "")
-    if gs:
-        lat, lon = grid2latlon(gs)
-        if lat is not None:
-            return pd.Series([lat, lon])
-    st = str(row.get("state") or "").upper()
-    if st and st in cent_all:
-        return pd.Series([cent_all[st]["lat"], cent_all[st]["lon"]])
-    c = str(row.get("country") or "").upper()
-    if not world_coords.empty:
-        m = world_coords[(world_coords.country_name == c) |
-                         (world_coords.iso2 == c) |
-                         (world_coords.iso3 == c)]
-        if not m.empty:
-            return pd.Series([float(m.lat.iloc[0]), float(m.lon.iloc[0])])
-    return pd.Series([np.nan, np.nan])
-
-df[["lat", "lon"]] = df.apply(_coords, axis=1)
-df = df.dropna(subset=["lat", "lon"])
-
-df["mode"] = df.get("mode", "").astype(str).str.upper()
-df["band"] = df.get("band", "").astype(str).str.upper()
-df["km"]   = df.apply(lambda r: hav(ORIGIN_LAT, ORIGIN_LON, r.lat, r.lon), axis=1)
-
-sent_cols = [c for c in df.columns if c in {"rst_sent", "rst_snt", "rst_out"}]
-rcvd_cols = [c for c in df.columns if c in {"rst_rcvd", "rst_rcv", "rst_in"}]
-df["rst_sent_num"] = pd.to_numeric(df[sent_cols[0]], errors="coerce") if sent_cols else np.nan
-df["rst_rcvd_num"] = pd.to_numeric(df[rcvd_cols[0]], errors="coerce") if rcvd_cols else np.nan
-
-total_qsos = len(df)
-dxcc_cnt   = df["country"].str.upper().nunique()
-
-def _us_mask(frame):
-    mask = pd.Series(False, index=frame.index)
-    if "country" in frame.columns:
-        mask |= frame["country"].str.upper().isin(
-            ["USA", "UNITED STATES", "UNITED STATES OF AMERICA"]
+class LogCache:
+    def __init__(self, path: str | Path):
+        resolved = Path(os.path.expanduser(path))
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(resolved)
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS qso (
+                log_id INTEGER PRIMARY KEY,
+                qso_date TEXT,
+                data TEXT NOT NULL
+            )
+            """
         )
-    if "dxcc" in frame.columns:
-        mask |= frame["dxcc"].astype(str).str.strip() == "291"
-    return mask
 
-us_states = (df.loc[_us_mask(df), "state"]
-              .astype(str)
-              .str.upper()
-              .nunique())
+    def max_log_id(self) -> int:
+        cur = self.conn.execute("SELECT MAX(log_id) FROM qso")
+        row = cur.fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
 
-ft8          = df[df["mode"] == "FT8"]
-avg_ft8_rcvd = ft8["rst_rcvd_num"].mean()
-avg_ft8_sent = ft8["rst_sent_num"].mean()
-last_upd     = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    def add_records(self, records: Iterable[dict]) -> int:
+        to_insert = []
+        for rec in records:
+            log_id = int(rec.get("app_qrzlog_logid", 0) or 0)
+            if not log_id:
+                continue
+            qso_date = normalize_date(rec.get("qso_date")) or normalize_date(rec.get("qso_date_off"))
+            to_insert.append((log_id, qso_date, json.dumps(rec)))
+        if not to_insert:
+            return 0
+        with self.conn:
+            self.conn.executemany("INSERT OR IGNORE INTO qso(log_id, qso_date, data) VALUES (?, ?, ?)", to_insert)
+        return len(to_insert)
+
+    def load_records(self, start: str | None, end: str | None) -> list[dict]:
+        clauses = []
+        params: list[str] = []
+        if start:
+            clauses.append("qso_date >= ?")
+            params.append(start)
+        if end:
+            clauses.append("qso_date <= ?")
+            params.append(end)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        cur = self.conn.execute(f"SELECT data FROM qso {where}", params)
+        return [json.loads(row[0]) for row in cur.fetchall()]
 
 
-# COMMAND ----------
-# Cell 6 – Robinson 4 K wallpaper (map restored, tighter metrics box)
+def fetch_new_records(api_key: str, user_agent: str, batch: int, after: int) -> list[dict]:
+    after_log = after
+    collected: list[dict] = []
+    while True:
+        opt = f"MAX:{batch}" + (f",AFTERLOGID:{after_log}" if after_log else "")
+        response = requests.post(
+            "https://logbook.qrz.com/api",
+            data={"KEY": api_key, "ACTION": "FETCH", "OPTION": opt},
+            headers={"User-Agent": user_agent},
+            timeout=30,
+        )
+        response.raise_for_status()
+        if "ADIF=" not in response.text:
+            break
+        adif_raw = html.unescape(response.text.split("ADIF=", 1)[1])
+        if not adif_raw.strip():
+            break
+        qsos, _ = adif_io.read_from_string("<adif_ver:5>3.1.0<eoh>\n" + adif_raw + "\n")
+        if not qsos:
+            break
+        collected.extend(qsos)
+        after_log = max(int(q.get("app_qrzlog_logid", 0) or 0) for q in qsos) + 1
+        if len(qsos) < batch:
+            break
+    return collected
 
-# MAGIC %pip install -q cartopy shapely pyproj
 
-import matplotlib.pyplot as plt
-import cartopy.crs as ccrs
-import cartopy.feature as cfeature
-from pathlib import Path
+def enrich_dataframe(records: list[dict], origin_lat: float, origin_lon: float) -> pd.DataFrame:
+    df = pd.DataFrame(records)
+    if df.empty:
+        return df
 
-Path("/dbfs/FileStore/pbuch/logbook").mkdir(parents=True, exist_ok=True)
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    df["mode"] = df.get("mode", "").astype(str).str.upper()
+    df["band"] = df.get("band", "").astype(str).str.upper()
 
-fig = plt.figure(figsize=(32.0, 16.0), dpi=300, facecolor=BG)
-gs  = fig.add_gridspec(1, 2, width_ratios=[4, 1], wspace=0.02)
+    lats, lons = [], []
+    for _, row in df.iterrows():
+        lat = parse_coord(row.get("lat"))
+        lon = parse_coord(row.get("lon"))
+        if lat is None or lon is None:
+            gs = str(row.get("gridsquare") or row.get("my_gridsquare") or "")
+            lat, lon = grid_to_latlon(gs) if gs else (None, None)
+        lats.append(lat)
+        lons.append(lon)
+    df["lat"], df["lon"] = lats, lons
+    df = df.dropna(subset=["lat", "lon"])
 
-# map axis
-ax = fig.add_subplot(gs[0], projection=ccrs.Robinson())
-ax.set_global()
-ax.set_facecolor(BG)
-ax.add_feature(cfeature.LAND.with_scale("50m"),  facecolor=LAND,  edgecolor="none")
-ax.add_feature(cfeature.OCEAN.with_scale("50m"), facecolor=OCEAN, edgecolor="none")
-edge = {"edgecolor": "#555", "linewidth": 0.4}
-ax.add_feature(cfeature.BORDERS.with_scale("50m"), **edge)
-ax.add_feature(cfeature.COASTLINE.with_scale("50m"), **edge)
+    def hav(lat1, lon1, lat2, lon2):
+        from math import radians, sin, cos, asin, sqrt
 
-for band, grp in df.groupby("band", sort=False):
-    clr = BAND_COLORS.get(band, TXT)
-    for _, r in grp.iterrows():
-        ax.plot([ORIGIN_LON, r.lon], [ORIGIN_LAT, r.lat],
-                color=clr, linewidth=0.8, transform=ccrs.Geodetic())
-    ax.scatter(grp["lon"], grp["lat"], s=35, color=clr, edgecolor=BG,
-               transform=ccrs.PlateCarree(), label=band, zorder=3)
+        dlat, dlon = map(radians, [lat2 - lat1, lon2 - lon1])
+        a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
+        return 2 * 6371 * asin(sqrt(a))
 
-ax.set_title("KC2QJA Logbook", fontsize=36, color=TITLE, family="monospace", pad=25)
-leg = ax.legend(facecolor=BG, edgecolor="none", fontsize=18,
-                labelcolor=TXT, loc="lower left")
-for t in leg.get_texts():
-    t.set_color(TXT)
+    df["distance_km"] = df.apply(lambda r: hav(origin_lat, origin_lon, r.lat, r.lon), axis=1)
+    return df
 
-# metrics axis
-ax_info = fig.add_subplot(gs[1])
-ax_info.set_facecolor(BG)
-ax_info.axis("off")
-metrics = (
-    f"Total QSOs : {total_qsos}\n"
-    f"Unique DXCC : {dxcc_cnt}\n"
-    f"US States   : {us_states}\n"
-    f"FT8 Avg RCVD: {avg_ft8_rcvd:.2f}\n"
-    f"FT8 Avg SENT: {avg_ft8_sent:.2f}\n"
-    f"Last update : {last_upd}"
-)
-ax_info.text(0.02, 0.5, metrics, ha="left", va="center",
-             fontsize=15, color=TXT, family="monospace",
-             linespacing=1.5,
-             bbox=dict(boxstyle="round,pad=0.6", fc=BG, ec=TXT, lw=1.1))
 
-fig.subplots_adjust(left=0.03, right=0.97, top=0.95, bottom=0.05)
-out_path = "/dbfs/FileStore/pbuch/logbook/7_22.png"
-fig.savefig(out_path, facecolor=BG)
-plt.close(fig)
-displayHTML(f'<img src="/files/pbuch/logbook/7_22.png" style="width:100%">')
+def compute_metrics(df: pd.DataFrame) -> dict:
+    if df.empty:
+        return {
+            "total_qsos": 0,
+            "unique_dxcc": 0,
+            "us_states": 0,
+            "avg_ft8_rcvd": float("nan"),
+            "avg_ft8_sent": float("nan"),
+        }
+    total_qsos = len(df)
+    dxcc_cnt = df.get("country", pd.Series([], dtype=str)).astype(str).str.upper().nunique()
+    us_mask = df.get("country", pd.Series([], dtype=str)).astype(str).str.upper().isin(
+        ["USA", "UNITED STATES", "UNITED STATES OF AMERICA"]
+    )
+    states = df.loc[us_mask, "state"].astype(str).str.upper().nunique()
+    ft8 = df[df["mode"] == "FT8"]
+    avg_ft8_rcvd = pd.to_numeric(ft8.get("rst_rcvd"), errors="coerce").mean()
+    avg_ft8_sent = pd.to_numeric(ft8.get("rst_sent"), errors="coerce").mean()
+    return {
+        "total_qsos": total_qsos,
+        "unique_dxcc": dxcc_cnt,
+        "us_states": states,
+        "avg_ft8_rcvd": avg_ft8_rcvd,
+        "avg_ft8_sent": avg_ft8_sent,
+    }
 
+
+def build_figure(df: pd.DataFrame, theme: dict, origin_lat: float, origin_lon: float, title: str) -> go.Figure:
+    fig = go.Figure()
+    if not df.empty:
+        for band, grp in df.groupby("band"):
+            fig.add_trace(
+                go.Scattergeo(
+                    lon=[origin_lon, *grp["lon"].tolist()],
+                    lat=[origin_lat, *grp["lat"].tolist()],
+                    mode="lines",
+                    line=dict(width=0.6, color=theme.get("accent", DEFAULT_THEME["accent"])),
+                    name=f"{band} paths",
+                    opacity=0.6,
+                )
+            )
+            fig.add_trace(
+                go.Scattergeo(
+                    lon=grp["lon"],
+                    lat=grp["lat"],
+                    mode="markers",
+                    marker=dict(size=6, color=theme.get("text", DEFAULT_THEME["text"])),
+                    name=f"{band} QSOs",
+                    text=grp.get("call"),
+                    hovertemplate="<b>%{text}</b><br>%{lat:.2f}, %{lon:.2f}<extra></extra>",
+                )
+            )
+
+    metrics = compute_metrics(df)
+    metrics_lines = [
+        f"Total QSOs : {metrics['total_qsos']}",
+        f"Unique DXCC : {metrics['unique_dxcc']}",
+        f"US States   : {metrics['us_states']}",
+        f"FT8 Avg RCVD: {metrics['avg_ft8_rcvd']:.2f}" if pd.notna(metrics["avg_ft8_rcvd"]) else "FT8 Avg RCVD: N/A",
+        f"FT8 Avg SENT: {metrics['avg_ft8_sent']:.2f}" if pd.notna(metrics["avg_ft8_sent"]) else "FT8 Avg SENT: N/A",
+        f"Last update : {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
+    ]
+    fig.add_annotation(
+        text="<br>".join(metrics_lines),
+        align="left",
+        showarrow=False,
+        x=0.98,
+        y=0.02,
+        xanchor="right",
+        yanchor="bottom",
+        bgcolor=theme.get("background", DEFAULT_THEME["background"]),
+        font=dict(color=theme.get("text", DEFAULT_THEME["text"])),
+        bordercolor=theme.get("text", DEFAULT_THEME["text"]),
+        borderwidth=1,
+    )
+
+    fig.update_layout(
+        title=title,
+        paper_bgcolor=theme.get("background", DEFAULT_THEME["background"]),
+        plot_bgcolor=theme.get("background", DEFAULT_THEME["background"]),
+        font=dict(color=theme.get("text", DEFAULT_THEME["text"])),
+        geo=dict(
+            showcountries=True,
+            showcoastlines=True,
+            projection_type="natural earth",
+            bgcolor=theme.get("background", DEFAULT_THEME["background"]),
+            landcolor=theme.get("land", DEFAULT_THEME["land"]),
+            oceancolor=theme.get("ocean", DEFAULT_THEME["ocean"]),
+        ),
+        legend=dict(bgcolor=theme.get("background", DEFAULT_THEME["background"])),
+        margin=dict(l=10, r=10, t=50, b=10),
+    )
+    return fig
+
+
+def load_theme(config: dict, name: str) -> dict:
+    themes = config.get("themes", {})
+    if name == "default":
+        return {**DEFAULT_THEME, **themes.get(name, {})}
+    return {**DEFAULT_THEME, **themes.get(name, {})}
+
+
+def main() -> None:
+    args = parse_args()
+    config = load_config(args.config)
+
+    api_key = os.getenv("QRZ_API_KEY") or config.get("api_key")
+    if not api_key:
+        raise ValueError("QRZ API key is required. Set QRZ_API_KEY or api_key in config.yaml.")
+
+    user_agent = config.get("user_agent", DEFAULT_UA)
+    batch = int(config.get("batch_size", DEFAULT_BATCH))
+    origin = config.get("origin", {})
+    origin_lat = float(origin.get("lat", 0))
+    origin_lon = float(origin.get("lon", 0))
+    cache_path = config.get("cache_path", DEFAULT_CACHE)
+    title = config.get("title", "QRZ Logbook")
+
+    cache = LogCache(cache_path)
+    last_log_id = cache.max_log_id()
+    new_records = fetch_new_records(api_key, user_agent, batch, last_log_id)
+    inserted = cache.add_records(new_records)
+    if inserted:
+        print(f"Cached {inserted} new QSOs (through log ID {cache.max_log_id()}).")
+
+    start = normalize_date(args.start_date)
+    end = normalize_date(args.end_date)
+    if start and end and start > end:
+        raise ValueError("Start date must be before end date.")
+
+    records = cache.load_records(start, end)
+    df = enrich_dataframe(records, origin_lat, origin_lon)
+    theme = load_theme(config, args.theme)
+
+    fig = build_figure(df, theme, origin_lat, origin_lon, title)
+    fig.write_html(args.output)
+    print(f"Wrote visualization to {args.output.resolve()}")
+
+
+if __name__ == "__main__":
+    main()

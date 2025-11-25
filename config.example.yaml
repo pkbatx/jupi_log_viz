@@ -1,0 +1,22 @@
+# Copy this file to config.yaml and fill in your QRZ API key.
+api_key: "YOUR_QRZ_API_KEY"
+user_agent: "YourCallsign-LogbookViz/2.0"
+batch_size: 250
+cache_path: "~/.cache/qrz_viz/cache.sqlite"
+title: "QRZ Logbook"
+origin:
+  lat: 30.4145
+  lon: -97.7411
+themes:
+  default:
+    background: "#000000"
+    land: "#141414"
+    ocean: "#002b36"
+    text: "#00FF7F"
+    accent: "#FF5555"
+  light:
+    background: "#FFFFFF"
+    land: "#f2f2f2"
+    ocean: "#e6f2ff"
+    text: "#0a1f44"
+    accent: "#e4572e"
