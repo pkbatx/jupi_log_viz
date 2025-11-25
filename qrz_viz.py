@@ -6,6 +6,7 @@ Usage examples:
     python qrz_viz.py --fetch-only
     python qrz_viz.py --visualize-only --theme light
 """
+
 from __future__ import annotations
 
 import argparse
@@ -80,9 +81,15 @@ class Config:
             theme = DEFAULT_CONFIG["themes"]["dark"]
         return cls(
             api_key=data.get("credentials", {}).get("api_key", ""),
-            user_agent=data.get("credentials", {}).get("user_agent", DEFAULT_CONFIG["credentials"]["user_agent"]),
-            cache_path=Path(data.get("paths", {}).get("cache", DEFAULT_CONFIG["paths"]["cache"])),
-            output_dir=Path(data.get("paths", {}).get("output", DEFAULT_CONFIG["paths"]["output"])),
+            user_agent=data.get("credentials", {}).get(
+                "user_agent", DEFAULT_CONFIG["credentials"]["user_agent"]
+            ),
+            cache_path=Path(
+                data.get("paths", {}).get("cache", DEFAULT_CONFIG["paths"]["cache"])
+            ),
+            output_dir=Path(
+                data.get("paths", {}).get("output", DEFAULT_CONFIG["paths"]["output"])
+            ),
             theme_name=theme_name,
             theme=theme,
         )
@@ -91,7 +98,9 @@ class Config:
         import tomllib
         import tomli_w
 
-        data = tomllib.loads(path.read_text()) if path.exists() else DEFAULT_CONFIG.copy()
+        data = (
+            tomllib.loads(path.read_text()) if path.exists() else DEFAULT_CONFIG.copy()
+        )
         data.setdefault("credentials", {})["api_key"] = key
         with path.open("wb") as fh:
             tomli_w.dump(data, fh)
@@ -139,6 +148,12 @@ def _parse_coord(val: str | None) -> float | None:
         return None
 
 
+def _parse_api_error(text: str) -> None:
+    if "ERROR=" in text:
+        msg = text.split("ERROR=", 1)[1].splitlines()[0].strip()
+        raise SystemExit(f"QRZ API error: {msg or 'Unknown error from QRZ'}")
+
+
 def iter_records(api_key: str, after: int, user_agent: str) -> Iterator[dict]:
     while True:
         opt = f"MAX:{BATCH}" + (f",AFTERLOGID:{after}" if after else "")
@@ -149,13 +164,27 @@ def iter_records(api_key: str, after: int, user_agent: str) -> Iterator[dict]:
             timeout=30,
         )
         resp.raise_for_status()
+        _parse_api_error(resp.text)
         if "ADIF=" not in resp.text:
+            snippet = " ".join(resp.text.strip().split())[:500]
+            print("QRZ API response contained no ADIF payload; stopping fetch.")
+            if snippet:
+                print(f"Response snippet: {snippet}")
             break
         adif_raw = resp.text.split("ADIF=", 1)[1]
         if not adif_raw.strip():
+            print("QRZ API returned an empty ADIF payload; no records fetched.")
             break
-        qsos, _ = adif_io.read_from_string("<adif_ver:5>3.1.0<eoh>\n" + adif_raw + "\n")
+        try:
+            qsos, _ = adif_io.read_from_string(
+                "<adif_ver:5>3.1.0<eoh>\n" + adif_raw + "\n"
+            )
+        except (
+            Exception
+        ) as exc:  # pragma: no cover - defensive against malformed payloads
+            raise SystemExit(f"Failed to parse ADIF payload: {exc}") from exc
         if not qsos:
+            print("No QSOs parsed from ADIF payload; stopping fetch.")
             break
         for qso in qsos:
             yield qso
@@ -203,7 +232,17 @@ def insert_records(conn: sqlite3.Connection, records: Iterable[dict]) -> int:
             INSERT OR IGNORE INTO qso (log_id, qso_date, band, mode, call, gridsquare, lat, lon, raw_json)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (log_id, qso_date, band, mode, call, rec.get("gridsquare"), lat, lon, json.dumps(rec)),
+            (
+                log_id,
+                qso_date,
+                band,
+                mode,
+                call,
+                rec.get("gridsquare"),
+                lat,
+                lon,
+                json.dumps(rec),
+            ),
         )
         inserted += cur.rowcount
     conn.commit()
@@ -251,7 +290,9 @@ def summarize(df: pd.DataFrame) -> dict:
 
 def visualize(df: pd.DataFrame, config: Config, start_date: str | None) -> Path:
     if df.empty:
-        raise SystemExit("No QSOs with location data to plot. Try fetching data or expanding the date range.")
+        raise SystemExit(
+            "No QSOs with location data to plot. Try fetching data or expanding the date range."
+        )
 
     colors = {
         "80M": "#00FF7F",
@@ -316,17 +357,35 @@ def configure(path: Path = DEFAULT_CONFIG_PATH) -> None:
     key = prompt_for_api_key(cfg.api_key)
     cfg.save_api_key(key, path)
     theme = cfg.theme_name
-    print(f"Stored API key. Current theme: {theme}. Edit {path} to change themes or paths.")
+    print(
+        f"Stored API key. Current theme: {theme}. Edit {path} to change themes or paths."
+    )
 
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="QRZ logbook visualizer")
-    parser.add_argument("--configure", action="store_true", help="Prompt for and store API key in config.toml")
-    parser.add_argument("--api-key", dest="api_key", help="Override API key from config")
-    parser.add_argument("--start-date", dest="start_date", help="YYYY-MM-DD; only visualize QSOs on/after this date")
+    parser.add_argument(
+        "--configure",
+        action="store_true",
+        help="Prompt for and store API key in config.toml",
+    )
+    parser.add_argument(
+        "--api-key", dest="api_key", help="Override API key from config"
+    )
+    parser.add_argument(
+        "--start-date",
+        dest="start_date",
+        help="YYYY-MM-DD; only visualize QSOs on/after this date",
+    )
     parser.add_argument("--theme", dest="theme", help="Theme name from config")
-    parser.add_argument("--fetch-only", action="store_true", help="Only fetch/cached data, skip visualization")
-    parser.add_argument("--visualize-only", action="store_true", help="Only visualize cached data")
+    parser.add_argument(
+        "--fetch-only",
+        action="store_true",
+        help="Only fetch/cached data, skip visualization",
+    )
+    parser.add_argument(
+        "--visualize-only", action="store_true", help="Only visualize cached data"
+    )
     args = parser.parse_args(argv)
 
     if args.configure:
@@ -343,6 +402,10 @@ def main(argv: list[str] | None = None) -> None:
     if needs_fetch:
         api_key = prompt_for_api_key(api_key)
         cfg.api_key = api_key
+        if not api_key:
+            raise SystemExit(
+                "An API key is required to fetch from the QRZ logbook. Configure one via --configure or pass --api-key."
+            )
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
 
     if needs_fetch:
