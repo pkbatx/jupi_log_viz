@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import html
 import json
 import sqlite3
 from dataclasses import dataclass
@@ -69,7 +70,10 @@ class Config:
 
     @classmethod
     def load(cls, path: Path = DEFAULT_CONFIG_PATH) -> "Config":
-        import tomllib
+        try:  # Python 3.11+
+            import tomllib  # type: ignore
+        except ModuleNotFoundError:  # pragma: no cover - fallback for <3.11
+            import tomli as tomllib  # type: ignore
 
         if not path.exists():
             write_default_config(path)
@@ -95,7 +99,10 @@ class Config:
         )
 
     def save_api_key(self, key: str, path: Path = DEFAULT_CONFIG_PATH) -> None:
-        import tomllib
+        try:  # Python 3.11+
+            import tomllib  # type: ignore
+        except ModuleNotFoundError:  # pragma: no cover - fallback for <3.11
+            import tomli as tomllib  # type: ignore
         import tomli_w
 
         data = (
@@ -142,6 +149,16 @@ def _parse_coord(val: str | None) -> float | None:
     val = str(val).strip()
     if not val:
         return None
+    if val[0] in "NSEW":
+        parts = val[1:].strip().replace(",", " ").split()
+        if len(parts) != 2:
+            return None
+        try:
+            deg, minutes = float(parts[0]), float(parts[1])
+        except ValueError:
+            return None
+        out = deg + minutes / 60.0
+        return -out if val[0] in "SW" else out
     try:
         return float(val)
     except ValueError:
@@ -171,7 +188,7 @@ def iter_records(api_key: str, after: int, user_agent: str) -> Iterator[dict]:
             if snippet:
                 print(f"Response snippet: {snippet}")
             break
-        adif_raw = resp.text.split("ADIF=", 1)[1]
+        adif_raw = html.unescape(resp.text.split("ADIF=", 1)[1])
         if not adif_raw.strip():
             print("QRZ API returned an empty ADIF payload; no records fetched.")
             break
@@ -225,8 +242,13 @@ def insert_records(conn: sqlite3.Connection, records: Iterable[dict]) -> int:
         call = str(rec.get("call", "")).upper() or None
         lat = _parse_coord(rec.get("lat")) or _parse_coord(rec.get("my_lat"))
         lon = _parse_coord(rec.get("lon")) or _parse_coord(rec.get("my_lon"))
-        if (lat is None or lon is None) and rec.get("gridsquare"):
-            lat, lon = grid2latlon(str(rec["gridsquare"]))
+        grid = (
+            rec.get("gridsquare")
+            or rec.get("my_gridsquare")
+            or rec.get("app_qrzlog_gridsquare")
+        )
+        if (lat is None or lon is None) and grid:
+            lat, lon = grid2latlon(str(grid))
         cur.execute(
             """
             INSERT OR IGNORE INTO qso (log_id, qso_date, band, mode, call, gridsquare, lat, lon, raw_json)

@@ -3,3 +3,4 @@ pandas
 plotly
 requests
 tomli_w
+tomli
