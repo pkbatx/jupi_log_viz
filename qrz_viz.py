@@ -236,6 +236,7 @@ def insert_records(conn: sqlite3.Connection, records: Iterable[dict]) -> int:
     inserted = 0
     for rec in records:
         log_id = int(rec.get("app_qrzlog_logid"))
+        rec_dict = dict(rec)
         qso_date = str(rec.get("qso_date"))
         band = str(rec.get("band", "")).upper() or None
         mode = str(rec.get("mode", "")).upper() or None
@@ -263,7 +264,7 @@ def insert_records(conn: sqlite3.Connection, records: Iterable[dict]) -> int:
                 rec.get("gridsquare"),
                 lat,
                 lon,
-                json.dumps(rec),
+                json.dumps(rec_dict),
             ),
         )
         inserted += cur.rowcount
