@@ -1,0 +1,5 @@
+adif_io
+pandas
+plotly
+requests
+tomli_w
